@@ -188,121 +188,163 @@ def two_largest(mask: np.ndarray)->Tuple[np.ndarray,np.ndarray]:
     return [(lab==a+1),(lab==b+1)]
 
 # ──────────────────────────── Main alignment node ─────────────────────────
+# ----------------------------------------------------------------------
+# Helper for manual mode: build 2×3 affine matrix (scale·R | t)
+import math
+def _build_affine(scale: float, angle_deg: float,
+                  tx: float, ty: float,
+                  cx: float, cy: float) -> np.ndarray:
+    th = math.radians(angle_deg)
+    R  = np.array([[math.cos(th), -math.sin(th)],
+                   [math.sin(th),  math.cos(th)]], np.float32) * scale
+    t  = np.array([tx, ty], np.float32) + np.array([cx, cy]) - R @ np.array([cx, cy])
+    return np.hstack([R, t[:, None]])
+# ----------------------------------------------------------------------
+
 class PoseAlignTwoToOne:
     CATEGORY = "AInseven"
 
     def __init__(self):
-        self._MA:Optional[np.ndarray]=None
-        self._MB:Optional[np.ndarray]=None
-        self._out_size:Optional[Tuple[int,int]]=None
+        self._MA: Optional[np.ndarray] = None
+        self._MB: Optional[np.ndarray] = None
+        self._out_size: Optional[Tuple[int, int]] = None
 
+    # ─────────────────────────── node inputs ──────────────────────────
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required":{
-                    "ref_pose_img":("IMAGE",),
-                    "ref_pose_json":("POSE_KEYPOINT",),
-                    "poseA_img":("IMAGE",),
-                    "poseA_json":("POSE_KEYPOINT",),
-                    "poseB_img":("IMAGE",),
-                    "poseB_json":("POSE_KEYPOINT",),
-                    "assignment":(["auto","A_to_first","A_to_second"],),
-                    "reset":("BOOLEAN",{"default":False}),
-                 },
-                "optional":{"debug":("BOOLEAN",{"default":False})}}
+        return {
+            "required": {
+                "ref_pose_img": ("IMAGE",),
+                "ref_pose_json": ("POSE_KEYPOINT",),
+                "poseA_img": ("IMAGE",),
+                "poseA_json": ("POSE_KEYPOINT",),
+                "poseB_img": ("IMAGE",),
+                "poseB_json": ("POSE_KEYPOINT",),
+                "assignment": (["auto", "A_to_first", "A_to_second"],),
+                "manual": ("BOOLEAN", {"default": False}),
+                "reset": ("BOOLEAN", {"default": False}),
+                # Manual-mode sliders for pose A
+                "angle_deg_A": ("FLOAT", {"default": 0, "min": -180, "max": 180, "step": 0.1}),
+                "scale_A": ("FLOAT", {"default": 1.0, "min": 0.20, "max": 3.0, "step": 0.01}),
+                "tx_A": ("INT", {"default": 0, "min": -2048, "max": 2048}),
+                "ty_A": ("INT", {"default": 0, "min": -2048, "max": 2048}),
+                # Manual-mode sliders for pose B
+                "angle_deg_B": ("FLOAT", {"default": 0, "min": -180, "max": 180, "step": 0.1}),
+                "scale_B": ("FLOAT", {"default": 1.0, "min": 0.20, "max": 3.0, "step": 0.01}),
+                "tx_B": ("INT", {"default": 0, "min": -2048, "max": 2048}),
+                "ty_B": ("INT", {"default": 0, "min": -2048, "max": 2048}),
+            },
+            "optional": {
+                "debug": ("BOOLEAN", {"default": False})
+            }
+        }
 
-    RETURN_TYPES = ("IMAGE","IMAGE","IMAGE","IMAGE")
-    RETURN_NAMES = ("aligned_poseA","aligned_poseB","combined_AB","combine_all")
-    FUNCTION     = "align"
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("aligned_poseA", "aligned_poseB", "combined_AB", "combine_all")
+    FUNCTION = "align"
 
-    def _get_kps(self,img:np.ndarray,js:List[Dict[str,Any]],idx:int)->Keypoints:
-        people=kps_from_pose_json(js)
-        return people[idx] if people and idx<len(people) else extract_kps_from_mask(img)
+    # ────────────────── helper to fetch key-points ────────────────────
+    def _get_kps(self, img: np.ndarray, js: List[Dict[str, Any]], idx: int) -> Keypoints:
+        people = kps_from_pose_json(js)
+        return people[idx] if people and idx < len(people) else extract_kps_from_mask(img)
 
-    # ------------------------------------------------------------------
+    # ───────────────────────── main function ──────────────────────────
     def align(self,
-              ref_pose_img:torch.Tensor, ref_pose_json:List[Dict[str,Any]],
-              poseA_img:torch.Tensor, poseA_json:List[Dict[str,Any]],
-              poseB_img:torch.Tensor, poseB_json:List[Dict[str,Any]],
-              assignment="auto", reset=False, debug=False):
+              ref_pose_img: torch.Tensor, ref_pose_json: List[Dict[str, Any]],
+              poseA_img: torch.Tensor, poseA_json: List[Dict[str, Any]],
+              poseB_img: torch.Tensor, poseB_json: List[Dict[str, Any]],
+              assignment="auto", manual=False, reset=False, debug=False,
+              angle_deg_A=0.0, scale_A=1.0, tx_A=0, ty_A=0,
+              angle_deg_B=0.0, scale_B=1.0, tx_B=0, ty_B=0):
 
-        N=poseA_img.shape[0]                          # batch
+        N = poseA_img.shape[0]                       # batch size
+        ref_np = torch_to_u8(ref_pose_img[0:1])
+        h, w = ref_np.shape[:2]
+        cx, cy = w / 2.0, h / 2.0
 
-        need_fit = reset or self._MA is None or self._MB is None
-        if need_fit:
-            ref_np=torch_to_u8(ref_pose_img[0:1])
-            A_np  =torch_to_u8(poseA_img[0:1])
-            B_np  =torch_to_u8(poseB_img[0:1])
-            h,w   = ref_np.shape[:2]
-
-            # reference people (w/ JSON ↔ image offset fix)
-            ref_people_raw=kps_from_pose_json(ref_pose_json)
-            if len(ref_people_raw)>=2:
-                m1,m2=two_largest(cv2.cvtColor(ref_np,cv2.COLOR_BGR2GRAY)>2)
-                img_people=[extract_kps_from_mask(ref_np,m1),
-                            extract_kps_from_mask(ref_np,m2)]
-                kR1=correct_json_offset(ref_people_raw[0],img_people[0])
-                kR2=correct_json_offset(ref_people_raw[1],img_people[1])
-            else:
-                m1,m2=two_largest(cv2.cvtColor(ref_np,cv2.COLOR_BGR2GRAY)>2)
-                kR1,kR2=extract_kps_from_mask(ref_np,m1),extract_kps_from_mask(ref_np,m2)
-
-            # pose A & B: JSON → corrected → used
-            kA_json=self._get_kps(A_np,poseA_json,0)
-            kB_json=self._get_kps(B_np,poseB_json,0)
-            kA_img =extract_kps_from_mask(A_np)
-            kB_img =extract_kps_from_mask(B_np)
-            kA     =correct_json_offset(kA_json,kA_img)
-            kB     =correct_json_offset(kB_json,kB_img)
-
-            # similarity fits
-            sA1,RA1,tA1,eA1=fit_pair(kA,kR1)
-            sB2,RB2,tB2,eB2=fit_pair(kB,kR2)
-            sA2,RA2,tA2,eA2=fit_pair(kA,kR2)
-            sB1,RB1,tB1,eB1=fit_pair(kB,kR1)
-
-            pick = 0 if assignment=="A_to_first" else \
-                   1 if assignment=="A_to_second" else \
-                   (0 if eA1+eB2<=eA2+eB1 else 1)
-
-            if pick==0:
-                sA,RA,tA = sA1,RA1,tA1
-                sB,RB,tB = sB2,RB2,tB2
-            else:
-                sA,RA,tA = sA2,RA2,tA2
-                sB,RB,tB = sB1,RB1,tB1
-
-            MA=np.hstack([sA*RA, tA[:,None]]).astype(np.float32)
-            MB=np.hstack([sB*RB, tB[:,None]]).astype(np.float32)
-            self._MA,self._MB,self._out_size = MA,MB,(w,h)
-            if debug: print("\n[PoseAlign] cached new transforms | size:",(w,h))
+        # ───────────── compute / fetch transformation matrices ───────
+        if manual:
+            # build from sliders (no caching needed)
+            MA = _build_affine(scale_A, angle_deg_A, tx_A, ty_A, cx, cy).astype(np.float32)
+            MB = _build_affine(scale_B, angle_deg_B, tx_B, ty_B, cx, cy).astype(np.float32)
         else:
-            MA,MB=self._MA,self._MB
-            w,h  =self._out_size
+            # automatic mode – identical to original implementation
+            need_fit = reset or self._MA is None or self._MB is None
+            if need_fit:
+                A_np = torch_to_u8(poseA_img[0:1])
+                B_np = torch_to_u8(poseB_img[0:1])
 
-        ref_np=torch_to_u8(ref_pose_img[0:1])
-        outA,outB,outC,outAll=[],[],[],[]
+                # reference key-points (with JSON↔image offset correction)
+                ref_people_raw = kps_from_pose_json(ref_pose_json)
+                if len(ref_people_raw) >= 2:
+                    m1, m2 = two_largest(cv2.cvtColor(ref_np, cv2.COLOR_BGR2GRAY) > 2)
+                    img_people = [extract_kps_from_mask(ref_np, m1),
+                                  extract_kps_from_mask(ref_np, m2)]
+                    kR1 = correct_json_offset(ref_people_raw[0], img_people[0])
+                    kR2 = correct_json_offset(ref_people_raw[1], img_people[1])
+                else:
+                    m1, m2 = two_largest(cv2.cvtColor(ref_np, cv2.COLOR_BGR2GRAY) > 2)
+                    kR1, kR2 = extract_kps_from_mask(ref_np, m1), extract_kps_from_mask(ref_np, m2)
+
+                # pose A & B key-points
+                kA_json = self._get_kps(A_np, poseA_json, 0)
+                kB_json = self._get_kps(B_np, poseB_json, 0)
+                kA_img = extract_kps_from_mask(A_np)
+                kB_img = extract_kps_from_mask(B_np)
+                kA = correct_json_offset(kA_json, kA_img)
+                kB = correct_json_offset(kB_json, kB_img)
+
+                # similarity fits
+                sA1, RA1, tA1, eA1 = fit_pair(kA, kR1)
+                sB2, RB2, tB2, eB2 = fit_pair(kB, kR2)
+                sA2, RA2, tA2, eA2 = fit_pair(kA, kR2)
+                sB1, RB1, tB1, eB1 = fit_pair(kB, kR1)
+
+                pick = 0 if assignment == "A_to_first" else \
+                       1 if assignment == "A_to_second" else \
+                       (0 if eA1 + eB2 <= eA2 + eB1 else 1)
+
+                if pick == 0:
+                    sA, RA, tA = sA1, RA1, tA1
+                    sB, RB, tB = sB2, RB2, tB2
+                else:
+                    sA, RA, tA = sA2, RA2, tA2
+                    sB, RB, tB = sB1, RB1, tB1
+
+                MA = np.hstack([sA * RA, tA[:, None]]).astype(np.float32)
+                MB = np.hstack([sB * RB, tB[:, None]]).astype(np.float32)
+                self._MA, self._MB, self._out_size = MA, MB, (w, h)
+                if debug:
+                    print(f"[PoseAlign] cached new transforms | size: {(w, h)}")
+            else:
+                MA, MB = self._MA, self._MB
+
+        # ─────────────────── apply transforms to batch ─────────────────
+        outA, outB, outC, outAll = [], [], [], []
         for i in range(N):
-            A_np=torch_to_u8(poseA_img[i:i+1])
-            B_np=torch_to_u8(poseB_img[i:i+1])
-            A_w=cv2.warpAffine(A_np,MA,(w,h),flags=cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_CONSTANT,borderValue=0)
-            B_w=cv2.warpAffine(B_np,MB,(w,h),flags=cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+            A_np = torch_to_u8(poseA_img[i:i+1])
+            B_np = torch_to_u8(poseB_img[i:i+1])
 
-            combined=np.where(A_w>0,A_w,B_w)
-            combo_all=ref_np.copy()
-            m=A_w>0; combo_all[m]=A_w[m]
-            m=B_w>0; combo_all[m]=B_w[m]
+            A_w = cv2.warpAffine(A_np, MA, (w, h), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            B_w = cv2.warpAffine(B_np, MB, (w, h), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+            combined = np.where(A_w > 0, A_w, B_w)
+            combo_all = ref_np.copy()
+            m = A_w > 0; combo_all[m] = A_w[m]
+            m = B_w > 0; combo_all[m] = B_w[m]
 
             outA.append(u8_to_torch(A_w))
             outB.append(u8_to_torch(B_w))
             outC.append(u8_to_torch(combined))
             outAll.append(u8_to_torch(combo_all))
 
-        return (torch.cat(outA,0),
-                torch.cat(outB,0),
-                torch.cat(outC,0),
-                torch.cat(outAll,0))
+        return (torch.cat(outA, 0),
+                torch.cat(outB, 0),
+                torch.cat(outC, 0),
+                torch.cat(outAll, 0))
+
 
 # ───────────────────── pose viewer debug node ─────────────────────────────
 class PoseViewer:
