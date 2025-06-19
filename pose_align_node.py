@@ -1,9 +1,9 @@
 """
-pose_align_node.py  –  ComfyUI custom nodes
+pose_align_node.py – ComfyUI custom nodes
 ────────────────────────────────────────────
-Align two single‑person pose layers to a two‑person reference pose *and*
+Align two single-person pose layers to a two-person reference pose *and*
 supply an easy viewer.  Once the reference scene is calibrated the node
-remembers the 2 × 3 affine matrices and applies them to every subsequent
+remembers the 2 × 3 affine matrices and applies them to every subsequent
 batch coming from two live video streams.
 
 ©2025 — MIT licence.
@@ -13,20 +13,25 @@ from __future__ import annotations
 import cv2, numpy as np, torch
 from typing import List, Dict, Any, Tuple, Optional
 
-# ─────────────────────────── body‑joint indices ────────────────────────────
+# ─────────────────────────── body-joint indices ────────────────────────────
 NOSE, NECK, R_SH, L_SH, MIDHIP = 0, 1, 2, 5, 8
+NUM_BODY_JOINTS   = 18
 FULL_TORSO        = [NOSE, NECK, R_SH, L_SH, MIDHIP]
 UPPER_TORSO       = [NOSE, NECK, R_SH, L_SH]
-NUM_BODY_JOINTS   = 18
 TORSO             = np.asarray([NOSE, NECK, R_SH, L_SH, MIDHIP])
 
-# OpenPose colour map (RGB 0‑255) used by the mask extractor
+# extra segments used for robust scaling
+HEAD_SEG  = [(15, 16), (0, 15), (0, 16)]    # ear-ear, nose-ear pairs
+TORSO_SEG = [(R_SH, L_SH), (NECK, MIDHIP)]  # shoulder width & neck-hip
+STABLE    = HEAD_SEG + TORSO_SEG            # full candidate set
+
+# OpenPose colour map (RGB 0-255) used by the mask extractor
 OPENPOSE_COLOUR_MAP = {
     0:(255,0,0),1:(255,85,0),2:(255,170,0),3:(255,255,0),4:(170,255,0),5:(85,255,0),6:(0,255,0),
     7:(0,255,85),8:(0,255,170),9:(0,255,255),10:(0,170,255),11:(0,85,255),12:(0,0,255),13:(85,0,255),
     14:(170,0,255),15:(255,0,255),16:(255,0,170),17:(255,0,85)}
 
-# BODY‑25 limb pairs for the viewer debug node
+# BODY-25 limb pairs for the viewer debug node
 BODY_25_PAIRS=[(1,8),(1,2),(1,5),(2,3),(3,4),(5,6),(6,7),(8,9),(9,10),(10,11),
                (8,12),(12,13),(13,14),(1,0),(0,15),(15,17),(0,16),(16,18),
                (14,19),(19,20),(14,21),(11,22),(22,23),(11,24)]
@@ -52,7 +57,7 @@ def u8_to_torch(bgr: np.ndarray) -> torch.Tensor:
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     return torch.from_numpy(rgb[None])    # (1,H,W,3) for ComfyUI
 
-# ───────────────────── JSON → key‑points utilities ─────────────────────────
+# ───────────────────── JSON → key-points utilities ─────────────────────────
 Keypoints = np.ndarray
 
 def _reshape(flat: List[float]) -> np.ndarray:
@@ -69,7 +74,7 @@ def _coords_to_xy(arr: np.ndarray, thr: float = 0.15) -> Keypoints:
 
 def dict_to_kps_single(p: Dict[str, Any], w: int, h: int) -> Keypoints:
     raw = _reshape(p["pose_keypoints_2d"] if "pose_keypoints_2d" in p else p["keypoints"])
-    if raw[:, :2].max() <= 1.01:  # normalised 0‑1 coords
+    if raw[:, :2].max() <= 1.01:  # normalised 0-1 coords
         raw[:, 0] *= w
         raw[:, 1] *= h
     return _coords_to_xy(raw)
@@ -86,11 +91,11 @@ def kps_from_pose_json(js: List[Dict[str, Any]]) -> List[Keypoints]:
                 for a in frame["animals"]]
     return []
 
-# ─────────────────────── Translation‑offset helpers ───────────────────────
+# ─────────────────────── Translation-offset helpers ───────────────────────
 
 def estimate_translation(kps_json: Keypoints, kps_img: Keypoints,
                          focus: np.ndarray = TORSO, min_pairs: int = 2) -> np.ndarray:
-    """Median (dx, dy) between matching visible joints."""
+    """Median (dx, dy) between matching visible joints."""
     vis = (~np.isnan(kps_json[:, 0]) & ~np.isnan(kps_img[:, 0]) &
            np.isin(np.arange(NUM_BODY_JOINTS), focus))
     if vis.sum() < min_pairs:
@@ -100,19 +105,22 @@ def estimate_translation(kps_json: Keypoints, kps_img: Keypoints,
 def correct_json_offset(kps_json: Keypoints, kps_img: Keypoints) -> Keypoints:
     return kps_json + estimate_translation(kps_json, kps_img)
 
-# ───────────────────── similarity & refinement helpers ────────────────────
-
-def procrustes(src: np.ndarray, dst: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
-    muX, muY = src.mean(0), dst.mean(0)
-    Xc, Yc = src - muX, dst - muY
-    U, _, Vt = np.linalg.svd(Xc.T @ Yc)
-    R = Vt.T @ U.T
-    if np.linalg.det(R) < 0:
-        Vt[1] *= -1
-        R = Vt.T @ U.T
-    s = np.sum(Yc * (R @ Xc.T).T) / np.sum(Xc**2)
-    t = muY - s * (R @ muX)
-    return float(s), R.astype(np.float32), t.astype(np.float32)
+# ─────────────────── robust scale & refinement helpers ────────────────────
+def robust_scale(src: Keypoints, dst: Keypoints, segments=STABLE) -> Optional[float]:
+    """
+    Median length ratio over a set of rigid bone segments.
+    Returns None if no common segments are visible.
+    """
+    ratios = []
+    for i, j in segments:
+        if (i < NUM_BODY_JOINTS and j < NUM_BODY_JOINTS and
+            not (np.isnan(src[i]).any() or np.isnan(src[j]).any() or
+                 np.isnan(dst[i]).any() or np.isnan(dst[j]).any())):
+            d_src = np.linalg.norm(src[i] - src[j])
+            d_dst = np.linalg.norm(dst[i] - dst[j])
+            if d_src > 1e-3:
+                ratios.append(d_dst / d_src)
+    return np.median(ratios) if ratios else None
 
 def refine_translation(src: Keypoints, dst: Keypoints, s: float, R: np.ndarray, t0: np.ndarray,
                        max_iter: int = 3, tol: float = 0.05) -> np.ndarray:
@@ -129,34 +137,6 @@ def refine_translation(src: Keypoints, dst: Keypoints, s: float, R: np.ndarray, 
         t += delta
     return t
 
-def two_largest(mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    n, lab = cv2.connectedComponents(mask.astype(np.uint8), 8)
-    if n <= 2:
-        return [mask], [np.zeros_like(mask, bool)]
-    areas = [(lab == i).sum() for i in range(1, n)]
-    a, b = np.argsort(areas)[-2:]
-    return [(lab == a + 1), (lab == b + 1)]
-
-def fit_pair(src: Keypoints, dst: Keypoints) -> Tuple[float, np.ndarray, np.ndarray, float]:
-    vis = ~np.isnan(src[:, 0]) & ~np.isnan(dst[:, 0])
-    if vis.sum() < 2:
-        return 1.0, np.eye(2, dtype=np.float32), np.zeros(2, np.float32), float("inf")
-    s, R = 1.0, np.eye(2, dtype=np.float32)
-    tiers = [FULL_TORSO, UPPER_TORSO, [NECK, MIDHIP], np.where(vis)[0]]
-    fit_mask = None
-    for idxs in tiers:
-        mask = vis & np.isin(np.arange(NUM_BODY_JOINTS), np.asarray(idxs))
-        if mask.sum() >= 2:
-            s, R, _ = procrustes(src[mask], dst[mask])
-            fit_mask = mask
-            break
-    if fit_mask is None:
-        return 1.0, np.eye(2, dtype=np.float32), np.zeros(2, np.float32), float("inf")
-    t = refine_translation(src, dst, s, R, np.zeros(2, np.float32))
-    recon = (s * (R @ src[fit_mask].T)).T + t
-    mse = float(np.mean(np.linalg.norm(recon - dst[fit_mask], axis=1) ** 2))
-    return s, R, t, mse
-
 def extract_kps_from_mask(img: np.ndarray, mask: Optional[np.ndarray] = None, tol: int = 10) -> Keypoints:
     if mask is None:
         mask = np.ones(img.shape[:2], bool)
@@ -168,6 +148,49 @@ def extract_kps_from_mask(img: np.ndarray, mask: Optional[np.ndarray] = None, to
             ys, xs = np.nonzero(m)
             kps[j] = (xs.mean(), ys.mean())
     return kps
+
+# ────────────────── similarity fit using robust scale ─────────────────────
+def fit_pair(src: Keypoints, dst: Keypoints) -> Tuple[float, np.ndarray, np.ndarray, float]:
+    """
+    Return (scale, rotation 2×2, translation 2, mse) that warps *src* → *dst*.
+    The scale is a robust median of multiple bone-length ratios; rotation and
+    translation are then solved analytically.
+    """
+    vis = ~np.isnan(src[:, 0]) & ~np.isnan(dst[:, 0])
+    if vis.sum() < 2:
+        return 1., np.eye(2, dtype=np.float32), np.zeros(2, np.float32), float("inf")
+
+    # ───── 1. robust multi-baseline scale ──────────────────────────────────
+    s = robust_scale(src, dst)
+    if s is None:
+        s = 1.0  # fallback when nothing is common
+
+    # ───── 2. rotation from Procrustes at that scale ───────────────────────
+    muX, muY = src[vis].mean(0), dst[vis].mean(0)
+    Xc, Yc = src[vis] - muX, dst[vis] - muY
+    U, _, Vt = np.linalg.svd(Xc.T @ Yc)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[1] *= -1
+        R = Vt.T @ U.T
+
+    # ───── 3. translation ─────────────────────────────────────────────────
+    t = muY - s * (R @ muX)
+    t = refine_translation(src, dst, s, R, t)
+
+    # ───── 4. residual error (for assignment logic) ───────────────────────
+    recon = (s * (R @ src[vis].T)).T + t
+    mse = float(np.mean(np.linalg.norm(recon - dst[vis], axis=1) ** 2))
+    return s, R.astype(np.float32), t.astype(np.float32), mse
+
+# ───────────────────────── helper for reference masks ─────────────────────
+def two_largest(mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    n, lab = cv2.connectedComponents(mask.astype(np.uint8), 8)
+    if n <= 2:
+        return [mask], [np.zeros_like(mask, bool)]
+    areas = [(lab == i).sum() for i in range(1, n)]
+    a, b = np.argsort(areas)[-2:]
+    return [(lab == a + 1), (lab == b + 1)]
 
 # ──────────────────────────── Main alignment node ─────────────────────────
 class PoseAlignTwoToOne:
@@ -201,7 +224,7 @@ class PoseAlignTwoToOne:
     RETURN_NAMES = ("aligned_poseA", "aligned_poseB", "combined_AB", "combine_all")
     FUNCTION = "align"
 
-    # helper to pull key‑points from json OR mask
+    # helper to pull key-points from json OR mask
     def _get_kps(self, img: np.ndarray, js: List[Dict[str, Any]], idx: int) -> Keypoints:
         people = kps_from_pose_json(js)
         return people[idx] if people and idx < len(people) else extract_kps_from_mask(img)
@@ -219,17 +242,16 @@ class PoseAlignTwoToOne:
         reset: bool = False,
         debug: bool = False,
     ):
-        """Align two single‑person pose frames (A,B) to a two‑person reference.
+        """
+        Align two single-person pose frames (A,B) to a two-person reference.
 
         * If *reset* is False and cached matrices exist, they are reused.
         * Otherwise the first frame of each input is used to recalibrate.
         """
-
-        # number of frames in current batch
-        N = poseA_img.shape[0]
+        N = poseA_img.shape[0]  # batch size
 
         # ---------------------------------------------------------
-        # (Re‑)fit similarity transforms if requested or missing
+        # (Re-)fit similarity transforms if requested or missing
         # ---------------------------------------------------------
         need_fit = reset or self._MA is None or self._MB is None
 
@@ -240,7 +262,7 @@ class PoseAlignTwoToOne:
             B_np   = torch_to_u8(poseB_img[0:1])
             h, w   = ref_np.shape[:2]
 
-            # ───── reference people (apply offset correction too) ───────────────
+            # ───── reference people (apply offset correction too) ───────────
             ref_people_raw = kps_from_pose_json(ref_pose_json)
             if len(ref_people_raw) >= 2:
                 m1, m2 = two_largest(cv2.cvtColor(ref_np, cv2.COLOR_BGR2GRAY) > 2)
@@ -251,7 +273,7 @@ class PoseAlignTwoToOne:
                 m1, m2 = two_largest(cv2.cvtColor(ref_np, cv2.COLOR_BGR2GRAY) > 2)
                 kR1, kR2 = extract_kps_from_mask(ref_np, m1), extract_kps_from_mask(ref_np, m2)
 
-            # ───── pose A & B: json → corrected → used -------------------------
+            # ───── pose A & B: json → corrected → used ---------------------
             kA_json = self._get_kps(A_np, poseA_json, 0)
             kB_json = self._get_kps(B_np, poseB_json, 0)
             kA_img  = extract_kps_from_mask(A_np)
@@ -259,7 +281,7 @@ class PoseAlignTwoToOne:
             kA      = correct_json_offset(kA_json, kA_img)
             kB      = correct_json_offset(kB_json, kB_img)
 
-            # ───── similarity fits ---------------------------------------------
+            # ───── similarity fits -----------------------------------------
             sA1, RA1, tA1, eA1 = fit_pair(kA, kR1)
             sB2, RB2, tB2, eB2 = fit_pair(kB, kR2)
             sA2, RA2, tA2, eA2 = fit_pair(kA, kR2)
@@ -379,3 +401,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAlignTwoToOne": "Pose Align (2→1)",
     "PoseViewer": "Pose Viewer (Debug)",
 }
+
