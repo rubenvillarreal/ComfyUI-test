@@ -4,36 +4,89 @@ __init__.py for the PoseAlignTwoToOne custom node package
 from aiohttp import web
 import json
 import time
+import sys
+import os
 
-# Import the node classes from your reorganized files
+# Add current directory to path to ensure imports work
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
+
+print(f"[PoseAlign] Loading from directory: {current_dir}")
+print(f"[PoseAlign] Files in directory: {os.listdir(current_dir)}")
+
+# Import the node classes from your files
 try:
-    from .pose_align_nodes import PoseAlignTwoToOne, PoseViewer
+    # Try importing from pose_align_node.py (correct filename)
+    from .pose_align_node import PoseAlignTwoToOne
     from .pose_align_utils import get_transform_data
-    print("[PoseAlign] Successfully imported nodes from reorganized files")
-except ImportError as e:
-    print(f"[PoseAlign] Import error with reorganized files: {e}")
-    print("[PoseAlign] Falling back to original imports...")
+    
+    print("[PoseAlign] Successfully imported PoseAlignTwoToOne and get_transform_data")
+    
+    # Try to import PoseViewer if it exists
     try:
-        # Fallback to original structure if reorganized files fail
-        from .pose_align_node import PoseAlignTwoToOne, get_transform_data
+        from .pose_align_node import PoseViewer
+        HAS_POSE_VIEWER = True
+        print("[PoseAlign] Successfully imported PoseViewer")
+    except ImportError:
+        HAS_POSE_VIEWER = False
+        print("[PoseAlign] PoseViewer not found, continuing without it")
+        
+except ImportError as e:
+    print(f"[PoseAlign] Import error: {e}")
+    print("[PoseAlign] Trying absolute imports...")
+    
+    try:
+        # Try absolute imports as fallback
+        import pose_align_node
+        import pose_align_utils
+        
+        PoseAlignTwoToOne = pose_align_node.PoseAlignTwoToOne
+        get_transform_data = pose_align_utils.get_transform_data
+        
         try:
-            from .pose_align_node import PoseViewer
+            PoseViewer = pose_align_node.PoseViewer
             HAS_POSE_VIEWER = True
-        except ImportError:
+        except:
             HAS_POSE_VIEWER = False
-            print("[PoseAlign] PoseViewer not found in fallback, skipping...")
+            
+        print("[PoseAlign] Absolute imports successful")
+        
     except ImportError as e2:
-        print(f"[PoseAlign] Fallback import also failed: {e2}")
+        print(f"[PoseAlign] Absolute import also failed: {e2}")
+        print("[PoseAlign] Creating dummy classes to prevent ComfyUI from crashing")
+        
         # Create dummy classes to prevent ComfyUI from crashing
         class PoseAlignTwoToOne:
             @classmethod
             def INPUT_TYPES(cls):
-                return {"required": {}}
+                return {
+                    "required": {
+                        "dummy": ("STRING", {"default": "Import failed - check console"}),
+                    }
+                }
             RETURN_TYPES = ("IMAGE",)
             FUNCTION = "dummy"
-            def dummy(self): pass
+            CATEGORY = "AInseven/Error"
+            
+            def dummy(self, dummy=""): 
+                import torch
+                # Return a black image to indicate error
+                return (torch.zeros(1, 64, 64, 3),)
+        
+        def get_transform_data(node_id):
+            return None
         
         HAS_POSE_VIEWER = False
+
+# Test the imported class
+try:
+    # Verify the class works
+    test_instance = PoseAlignTwoToOne()
+    input_types = PoseAlignTwoToOne.INPUT_TYPES()
+    print(f"[PoseAlign] Node validation successful. Input types: {list(input_types.get('required', {}).keys())}")
+except Exception as e:
+    print(f"[PoseAlign] Node validation failed: {e}")
 
 # Tell ComfyUI about the nodes in this package
 NODE_CLASS_MAPPINGS = {
@@ -45,21 +98,34 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 }
 
 # Add PoseViewer if available
-try:
-    if 'PoseViewer' in globals():
+if HAS_POSE_VIEWER:
+    try:
         NODE_CLASS_MAPPINGS["PoseViewer"] = PoseViewer
         NODE_DISPLAY_NAME_MAPPINGS["PoseViewer"] = "Pose Viewer (Debug)"
-    elif HAS_POSE_VIEWER:
-        NODE_CLASS_MAPPINGS["PoseViewer"] = PoseViewer  
-        NODE_DISPLAY_NAME_MAPPINGS["PoseViewer"] = "Pose Viewer (Debug)"
-except:
-    print("[PoseAlign] PoseViewer not added to mappings")
+        print("[PoseAlign] PoseViewer added to mappings")
+    except Exception as e:
+        print(f"[PoseAlign] Failed to add PoseViewer to mappings: {e}")
+
+print(f"[PoseAlign] Final node mappings: {list(NODE_CLASS_MAPPINGS.keys())}")
 
 # Tell ComfyUI that this node has a web directory to serve
 WEB_DIRECTORY = "./web"
 
+# Check if web directory exists
+web_dir = os.path.join(current_dir, "web")
+if os.path.exists(web_dir):
+    print(f"[PoseAlign] Web directory found: {web_dir}")
+    web_files = []
+    for root, dirs, files in os.walk(web_dir):
+        for file in files:
+            rel_path = os.path.relpath(os.path.join(root, file), web_dir)
+            web_files.append(rel_path)
+    print(f"[PoseAlign] Web files: {web_files}")
+else:
+    print(f"[PoseAlign] Web directory not found: {web_dir}")
+
 # ──────────────────────────── API ROUTES FOR CANVAS SYNC ─────────────────────────
-# This is the CORRECT way to register routes in ComfyUI based on the official documentation
+# This is the CORRECT way to register routes in ComfyUI
 
 try:
     from server import PromptServer
@@ -89,7 +155,7 @@ try:
                 'offsetCorrections': {'A': {'x': 0, 'y': 0}, 'B': {'x': 0, 'y': 0}}
             }, status=200)  # Return 200 instead of 500 to avoid console errors
     
-    print("[PoseAlign] API routes registered successfully using PromptServer.instance.routes")
+    print("[PoseAlign] API routes registered successfully")
 
 except ImportError as e:
     print(f"[PoseAlign] Could not import PromptServer: {e}")
@@ -98,4 +164,7 @@ except Exception as e:
     print(f"[PoseAlign] Error registering API routes: {e}")
     print("[PoseAlign] Canvas will fall back to widget-only mode")
 
+# Export everything ComfyUI needs
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']
+
+print("[PoseAlign] __init__.py loading complete!")
