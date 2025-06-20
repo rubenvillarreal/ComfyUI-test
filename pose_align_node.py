@@ -1,18 +1,17 @@
 """
-pose_align_node.py – ComfyUI custom nodes
-────────────────────────────────────────────
-Align two single-person pose layers to a two-person reference pose *and*
-supply an easy viewer.  Once the reference scene is calibrated the node
-remembers the 2 × 3 affine matrices and applies them to every subsequent
-batch coming from two live video streams.
-
-©2025 — MIT licence.
+pose_align_node_imgs_storage.py – ComfyUI custom nodes with proper image storage
+────────────────────────────────────────────────────────────────────────────
+Uses ComfyUI's built-in image storage mechanism that the frontend can access.
 """
 
 from __future__ import annotations
-import cv2, numpy as np, torch
+import cv2, numpy as np, torch, os, json, folder_paths
 from typing import List, Dict, Any, Tuple, Optional
+from PIL import Image
+import uuid
+from nodes import PreviewImage
 
+# [Keep all the existing helper functions from your original code]
 # ─────────────────────────── body-joint indices ────────────────────────────
 NOSE, NECK, R_SH, L_SH, MIDHIP = 0, 1, 2, 5, 8
 NUM_BODY_JOINTS   = 18
@@ -52,7 +51,14 @@ def u8_to_torch(bgr: np.ndarray) -> torch.Tensor:
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.
     return torch.from_numpy(rgb[None])            # (1,H,W,3) for ComfyUI
 
-# ───────────────────── JSON → key-points utilities ─────────────────────────
+def torch_to_pil(tensor: torch.Tensor) -> Image.Image:
+    """Convert torch tensor to PIL Image for saving"""
+    chw = _to_chw(tensor)
+    rgb = chw.permute(1,2,0).cpu().numpy()
+    rgb_uint8 = (rgb * 255).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(rgb_uint8)
+
+# [Include all the existing helper functions...]
 Keypoints = np.ndarray
 
 def _reshape(flat: List[float]) -> np.ndarray:
@@ -86,7 +92,6 @@ def kps_from_pose_json(js: List[Dict[str,Any]]) -> List[Keypoints]:
                 for a in frame["animals"]]
     return []
 
-# ─────── mismatch (JSON vs image) translation helpers – keep! ─────────────
 def estimate_translation(kps_json: Keypoints, kps_img: Keypoints,
                          focus: np.ndarray = TORSO, min_pairs: int = 2) -> np.ndarray:
     vis = (~np.isnan(kps_json[:,0]) & ~np.isnan(kps_img[:,0]) &
@@ -98,7 +103,6 @@ def estimate_translation(kps_json: Keypoints, kps_img: Keypoints,
 def correct_json_offset(kps_json: Keypoints, kps_img: Keypoints) -> Keypoints:
     return kps_json + estimate_translation(kps_json, kps_img)
 
-# ───────────────── robust scale & translation helpers ─────────────────────
 def robust_scale(src: Keypoints, dst: Keypoints) -> Optional[float]:
     ratios = []
     for i,j in STABLE_SEGMENTS:
@@ -136,7 +140,6 @@ def refine_translation(src: Keypoints, dst: Keypoints,
         t += delta
     return t
 
-# ───────────── colour-mask → key-points (viewer / fallback) ───────────────
 def extract_kps_from_mask(img: np.ndarray,
                           mask: Optional[np.ndarray]=None, tol: int = 10) -> Keypoints:
     if mask is None:
@@ -150,7 +153,6 @@ def extract_kps_from_mask(img: np.ndarray,
             kps[j]=(xs.mean(),ys.mean())
     return kps
 
-# ───────────── similarity fit (robust scale + robust translation) ─────────
 def fit_pair(src: Keypoints, dst: Keypoints
             ) -> Tuple[float,np.ndarray,np.ndarray,float]:
     vis = ~np.isnan(src[:,0]) & ~np.isnan(dst[:,0])
@@ -178,7 +180,6 @@ def fit_pair(src: Keypoints, dst: Keypoints
     mse = float(np.mean(np.linalg.norm(recon-dst[vis],axis=1)**2))
     return s, R.astype(np.float32), t.astype(np.float32), mse
 
-# ───────── two largest blobs helper for reference split ───────────────────
 def two_largest(mask: np.ndarray)->Tuple[np.ndarray,np.ndarray]:
     n,lab = cv2.connectedComponents(mask.astype(np.uint8), 8)
     if n<=2:
@@ -187,9 +188,6 @@ def two_largest(mask: np.ndarray)->Tuple[np.ndarray,np.ndarray]:
     a,b  = np.argsort(areas)[-2:]
     return [(lab==a+1),(lab==b+1)]
 
-# ──────────────────────────── Main alignment node ─────────────────────────
-# ----------------------------------------------------------------------
-# Helper for manual mode: build 2×3 affine matrix (scale·R | t)
 import math
 def _build_affine(scale: float, angle_deg: float,
                   tx: float, ty: float,
@@ -199,12 +197,20 @@ def _build_affine(scale: float, angle_deg: float,
                    [math.sin(th),  math.cos(th)]], np.float32) * scale
     t  = np.array([tx, ty], np.float32) + np.array([cx, cy]) - R @ np.array([cx, cy])
     return np.hstack([R, t[:, None]])
-# ----------------------------------------------------------------------
 
-class PoseAlignTwoToOne:
+# ──────────────────────────── Enhanced Main alignment node ─────────────────────────
+class PoseAlignTwoToOne(PreviewImage):
     CATEGORY = "AInseven"
 
     def __init__(self):
+        # Initialize parent class
+        super().__init__()
+
+        # Add the required attribute for PreviewImage
+        self.prefix_append = ""
+        self.compress_level = 4
+
+        # Your custom attributes
         self._MA: Optional[np.ndarray] = None
         self._MB: Optional[np.ndarray] = None
         self._out_size: Optional[Tuple[int, int]] = None
@@ -236,6 +242,10 @@ class PoseAlignTwoToOne:
             },
             "optional": {
                 "debug": ("BOOLEAN", {"default": False})
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
             }
         }
 
@@ -248,6 +258,41 @@ class PoseAlignTwoToOne:
         people = kps_from_pose_json(js)
         return people[idx] if people and idx < len(people) else extract_kps_from_mask(img)
 
+    # ─────────────────── NEW: Store images using ComfyUI's PreviewImage system ─────────────────
+    def _save_preview_images(self, ref_pose_img, poseA_img, poseB_img, prompt=None, extra_pnginfo=None):
+        """Save input images using ComfyUI's PreviewImage mechanism"""
+
+        # Get tensors from the first batch
+        ref_tensor = ref_pose_img[0:1]
+        A_tensor = poseA_img[0:1]
+        B_tensor = poseB_img[0:1]
+
+        # Find the maximum height and width
+        max_height = max(ref_tensor.shape[1], A_tensor.shape[1], B_tensor.shape[1])
+        max_width = max(ref_tensor.shape[2], A_tensor.shape[2], B_tensor.shape[2])
+
+        # Resize all images to the same dimensions
+        import torch.nn.functional as F
+
+        def resize_tensor(tensor, target_h, target_w):
+            # tensor shape: (B, H, W, C) in ComfyUI
+            # Need to permute to (B, C, H, W) for F.interpolate
+            tensor = tensor.permute(0, 3, 1, 2)
+            resized = F.interpolate(tensor, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            # Permute back to (B, H, W, C)
+            return resized.permute(0, 2, 3, 1)
+
+        # Resize all images to the maximum dimensions
+        ref_resized = resize_tensor(ref_tensor, max_height, max_width)
+        A_resized = resize_tensor(A_tensor, max_height, max_width)
+        B_resized = resize_tensor(B_tensor, max_height, max_width)
+
+        # Stack images horizontally (along width dimension)
+        combined = torch.cat([ref_resized, A_resized, B_resized], dim=2)  # dim=2 is width in (B,H,W,C)
+
+        # Use PreviewImage's save_images method
+        return self.save_images(combined, filename_prefix="pose_align_preview", prompt=prompt, extra_pnginfo=extra_pnginfo)
+
     # ───────────────────────── main function ──────────────────────────
     def align(self,
               ref_pose_img: torch.Tensor, ref_pose_json: List[Dict[str, Any]],
@@ -255,7 +300,11 @@ class PoseAlignTwoToOne:
               poseB_img: torch.Tensor, poseB_json: List[Dict[str, Any]],
               assignment="auto", manual=False, reset=False, debug=False,
               angle_deg_A=0.0, scale_A=1.0, tx_A=0, ty_A=0,
-              angle_deg_B=0.0, scale_B=1.0, tx_B=0, ty_B=0):
+              angle_deg_B=0.0, scale_B=1.0, tx_B=0, ty_B=0,
+              prompt=None, extra_pnginfo=None):
+
+        # Save preview images - this will populate the UI metadata
+        ui_result = self._save_preview_images(ref_pose_img, poseA_img, poseB_img, prompt, extra_pnginfo)
 
         N = poseA_img.shape[0]                       # batch size
         ref_np = torch_to_u8(ref_pose_img[0:1])
@@ -340,13 +389,19 @@ class PoseAlignTwoToOne:
             outC.append(u8_to_torch(combined))
             outAll.append(u8_to_torch(combo_all))
 
-        return (torch.cat(outA, 0),
-                torch.cat(outB, 0),
-                torch.cat(outC, 0),
-                torch.cat(outAll, 0))
+        result = {"result": (torch.cat(outA, 0),
+                            torch.cat(outB, 0),
+                            torch.cat(outC, 0),
+                            torch.cat(outAll, 0))}
+        
+        # Merge UI result with output result
+        if "ui" in ui_result:
+            result["ui"] = ui_result["ui"]
+            
+        return result
 
 
-# ───────────────────── pose viewer debug node ─────────────────────────────
+# ───────────────────── pose viewer debug node (unchanged) ──────────────────
 class PoseViewer:
     CATEGORY="AInseven/Debug"
 

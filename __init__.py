@@ -1,21 +1,25 @@
+# ©2025 – MIT licence
 """
-Register PoseAlignTwoToOne and the new PoseViewer with ComfyUI
+__init__.py for the PoseAlignTwoToOne custom node package
 """
 
-# 1. Import both classes from your node file
+# Import the node classes from your python file
 from .pose_align_node import PoseAlignTwoToOne, PoseViewer
 
-# 2. Add both classes to the mapping
+# Tell ComfyUI about the nodes in this package
 NODE_CLASS_MAPPINGS = {
     "PoseAlignTwoToOne": PoseAlignTwoToOne,
-    "PoseViewer": PoseViewer # <-- Add this line
+    "PoseViewer": PoseViewer,
 }
 
-# 3. Give each class a user-friendly name for the menu
+# Give the nodes a friendly name for the UI
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "PoseAlignTwoToOne": "Pose Align (Full Body)",
-    "PoseViewer": "Pose Viewer (Debug)" # <-- Add this line
+    "PoseAlignTwoToOne": "Pose Align (2→1)",
+    "PoseViewer": "Pose Viewer (Debug)",
 }
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+# Tell ComfyUI that this node has a web directory to serve
+# This is the crucial line that will load your javascript
+WEB_DIRECTORY = "./web"
 
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']
