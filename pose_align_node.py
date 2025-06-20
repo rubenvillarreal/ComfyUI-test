@@ -1,7 +1,5 @@
 """
-pose_align_node_imgs_storage.py – ComfyUI custom nodes with proper image storage
-────────────────────────────────────────────────────────────────────────────
-Uses ComfyUI's built-in image storage mechanism that the frontend can access.
+pose_align_node_fixed.py – ComfyUI custom nodes with data export for canvas sync
 """
 
 from __future__ import annotations
@@ -10,6 +8,10 @@ from typing import List, Dict, Any, Tuple, Optional
 from PIL import Image
 import uuid
 from nodes import PreviewImage
+import math
+import time
+from aiohttp import web
+import aiohttp
 
 # [Keep all the existing helper functions from your original code]
 # ─────────────────────────── body-joint indices ────────────────────────────
@@ -188,15 +190,91 @@ def two_largest(mask: np.ndarray)->Tuple[np.ndarray,np.ndarray]:
     a,b  = np.argsort(areas)[-2:]
     return [(lab==a+1),(lab==b+1)]
 
-import math
+def normalize_angle(angle_deg: float) -> float:
+    """Normalize angle to 0-360 degrees range"""
+    return ((angle_deg % 360) + 360) % 360
+
 def _build_affine(scale: float, angle_deg: float,
                   tx: float, ty: float,
                   cx: float, cy: float) -> np.ndarray:
+    # Normalize angle to prevent overflow issues
+    angle_deg = normalize_angle(angle_deg)
+    
     th = math.radians(angle_deg)
     R  = np.array([[math.cos(th), -math.sin(th)],
                    [math.sin(th),  math.cos(th)]], np.float32) * scale
     t  = np.array([tx, ty], np.float32) + np.array([cx, cy]) - R @ np.array([cx, cy])
     return np.hstack([R, t[:, None]])
+
+def decompose_affine_matrix(matrix: np.ndarray, cx: float, cy: float) -> Tuple[float, float, float, float]:
+    """
+    Decompose an affine transformation matrix back into scale, rotation, and translation components.
+    
+    Args:
+        matrix: 2x3 affine transformation matrix [R|t] where R is 2x2 rotation+scale, t is 2x1 translation
+        cx, cy: Center of rotation used in the original transformation
+        
+    Returns:
+        (scale, angle_deg, tx, ty) - Individual transformation components
+    """
+    # Extract rotation+scale matrix and translation vector
+    R = matrix[:2, :2]  # 2x2 rotation+scale matrix
+    t = matrix[:2, 2]   # 2x1 translation vector
+    
+    # Decompose scale and rotation from the 2x2 matrix
+    # For a rotation+scale matrix: R = scale * [[cos(θ), -sin(θ)], [sin(θ), cos(θ)]]
+    scale = np.sqrt(np.linalg.det(R))  # Determinant gives scale^2 for rotation matrix
+    
+    # Handle potential negative scales (reflections)
+    if np.linalg.det(R) < 0:
+        scale = -scale
+    
+    # Extract rotation matrix by normalizing out the scale
+    R_normalized = R / scale
+    
+    # Extract angle from normalized rotation matrix
+    # cos(θ) = R_normalized[0,0], sin(θ) = R_normalized[1,0]
+    angle_rad = math.atan2(R_normalized[1, 0], R_normalized[0, 0])
+    angle_deg = math.degrees(angle_rad)
+    
+    # Recover the original translation (tx, ty) by reversing the center compensation
+    # In _build_affine: final_t = t + center - R @ center
+    # So: original_t = final_t - center + R @ center
+    center = np.array([cx, cy])
+    original_t = t - center + R @ center
+    
+    tx, ty = original_t[0], original_t[1]
+    
+    # Normalize angle to 0-360 range
+    angle_deg = normalize_angle(angle_deg)
+    
+    return float(scale), float(angle_deg), float(tx), float(ty)
+
+# Global storage for transformation data (for API access)
+_transform_data_cache = {}
+
+def store_transform_data(node_id: str, matrices: Dict[str, np.ndarray], offset_corrections: Dict[str, Dict[str, float]]):
+    """Store transformation data for API access"""
+    global _transform_data_cache
+    
+    # Convert numpy arrays to lists for JSON serialization
+    serializable_matrices = {}
+    for key, matrix in matrices.items():
+        if matrix is not None:
+            serializable_matrices[key] = matrix.tolist()
+        else:
+            serializable_matrices[key] = None
+    
+    _transform_data_cache[node_id] = {
+        'timestamp': time.time(),
+        'matrices': serializable_matrices,
+        'offsetCorrections': offset_corrections
+    }
+
+def get_transform_data(node_id: str) -> Optional[Dict]:
+    """Retrieve transformation data for API access"""
+    global _transform_data_cache
+    return _transform_data_cache.get(node_id)
 
 # ──────────────────────────── Enhanced Main alignment node ─────────────────────────
 class PoseAlignTwoToOne(PreviewImage):
@@ -214,6 +292,7 @@ class PoseAlignTwoToOne(PreviewImage):
         self._MA: Optional[np.ndarray] = None
         self._MB: Optional[np.ndarray] = None
         self._out_size: Optional[Tuple[int, int]] = None
+        self._offset_corrections: Dict[str, Dict[str, float]] = {'A': {'x': 0, 'y': 0}, 'B': {'x': 0, 'y': 0}}
 
     # ─────────────────────────── node inputs ──────────────────────────
     @classmethod
@@ -230,12 +309,12 @@ class PoseAlignTwoToOne(PreviewImage):
                 "manual": ("BOOLEAN", {"default": False}),
                 "reset": ("BOOLEAN", {"default": False}),
                 # Manual-mode sliders for pose A
-                "angle_deg_A": ("FLOAT", {"default": 0, "min": -180, "max": 180, "step": 0.1}),
+                "angle_deg_A": ("FLOAT", {"default": 0, "min": -720, "max": 720, "step": 0.1}),
                 "scale_A": ("FLOAT", {"default": 1.0, "min": 0.20, "max": 3.0, "step": 0.01}),
                 "tx_A": ("INT", {"default": 0, "min": -2048, "max": 2048}),
                 "ty_A": ("INT", {"default": 0, "min": -2048, "max": 2048}),
                 # Manual-mode sliders for pose B
-                "angle_deg_B": ("FLOAT", {"default": 0, "min": -180, "max": 180, "step": 0.1}),
+                "angle_deg_B": ("FLOAT", {"default": 0, "min": -720, "max": 720, "step": 0.1}),
                 "scale_B": ("FLOAT", {"default": 1.0, "min": 0.20, "max": 3.0, "step": 0.01}),
                 "tx_B": ("INT", {"default": 0, "min": -2048, "max": 2048}),
                 "ty_B": ("INT", {"default": 0, "min": -2048, "max": 2048}),
@@ -258,7 +337,7 @@ class PoseAlignTwoToOne(PreviewImage):
         people = kps_from_pose_json(js)
         return people[idx] if people and idx < len(people) else extract_kps_from_mask(img)
 
-    # ─────────────────── NEW: Store images using ComfyUI's PreviewImage system ─────────────────
+    # ─────────────────── Store images using ComfyUI's PreviewImage system ─────────────────
     def _save_preview_images(self, ref_pose_img, poseA_img, poseB_img, prompt=None, extra_pnginfo=None):
         """Save input images using ComfyUI's PreviewImage mechanism"""
 
@@ -293,6 +372,57 @@ class PoseAlignTwoToOne(PreviewImage):
         # Use PreviewImage's save_images method
         return self.save_images(combined, filename_prefix="pose_align_preview", prompt=prompt, extra_pnginfo=extra_pnginfo)
 
+    def _update_widget_values(self, cx: float, cy: float, debug: bool = False):
+        """
+        Decompose cached transformation matrices and update widget values.
+        This ensures the canvas widget can read the current transformation parameters.
+        """
+        if self._MA is not None:
+            scale_A, angle_deg_A, tx_A, ty_A = decompose_affine_matrix(self._MA, cx, cy)
+            
+            # Update node properties (which the canvas reads)
+            self.properties = getattr(self, 'properties', {})
+            self.properties.update({
+                'scale_A': scale_A,
+                'angle_deg_A': angle_deg_A,
+                'tx_A': int(round(tx_A)),
+                'ty_A': int(round(ty_A))
+            })
+            
+            if debug:
+                print(f"[PoseAlign] Updated widget A: scale={scale_A:.3f}, angle={angle_deg_A:.1f}°, tx={tx_A:.1f}, ty={ty_A:.1f}")
+        
+        if self._MB is not None:
+            scale_B, angle_deg_B, tx_B, ty_B = decompose_affine_matrix(self._MB, cx, cy)
+            
+            # Update node properties (which the canvas reads)
+            self.properties = getattr(self, 'properties', {})
+            self.properties.update({
+                'scale_B': scale_B,
+                'angle_deg_B': angle_deg_B,
+                'tx_B': int(round(tx_B)),
+                'ty_B': int(round(ty_B))
+            })
+            
+            if debug:
+                print(f"[PoseAlign] Updated widget B: scale={scale_B:.3f}, angle={angle_deg_B:.1f}°, tx={tx_B:.1f}, ty={ty_B:.1f}")
+
+    def _store_transform_data_for_canvas(self, debug: bool = False):
+        """Store transformation data for canvas access via API"""
+        node_id = str(id(self))  # Use object id as unique identifier
+        
+        matrices = {
+            'A': self._MA,
+            'B': self._MB
+        }
+        
+        # Store the transformation data
+        store_transform_data(node_id, matrices, self._offset_corrections)
+        
+        if debug:
+            print(f"[PoseAlign] Stored transform data for node {node_id}")
+            print(f"[PoseAlign] Offset corrections: {self._offset_corrections}")
+
     # ───────────────────────── main function ──────────────────────────
     def align(self,
               ref_pose_img: torch.Tensor, ref_pose_json: List[Dict[str, Any]],
@@ -311,11 +441,29 @@ class PoseAlignTwoToOne(PreviewImage):
         h, w = ref_np.shape[:2]
         cx, cy = w / 2.0, h / 2.0
 
+        # Normalize angles to prevent issues
+        angle_deg_A = normalize_angle(angle_deg_A)
+        angle_deg_B = normalize_angle(angle_deg_B)
+
         # ───────────── compute / fetch transformation matrices ───────
         if manual:
             # build from sliders (no caching needed)
             MA = _build_affine(scale_A, angle_deg_A, tx_A, ty_A, cx, cy).astype(np.float32)
             MB = _build_affine(scale_B, angle_deg_B, tx_B, ty_B, cx, cy).astype(np.float32)
+            
+            # Update properties even in manual mode to keep canvas in sync
+            self.properties = getattr(self, 'properties', {})
+            self.properties.update({
+                'scale_A': scale_A, 'angle_deg_A': angle_deg_A, 'tx_A': tx_A, 'ty_A': ty_A,
+                'scale_B': scale_B, 'angle_deg_B': angle_deg_B, 'tx_B': tx_B, 'ty_B': ty_B
+            })
+            
+            # Store current matrices and offset corrections for canvas
+            self._MA, self._MB = MA, MB
+            
+            if debug:
+                print(f"[PoseAlign] Manual mode - A: scale={scale_A:.3f}, angle={angle_deg_A:.1f}°, tx={tx_A}, ty={ty_A}")
+                print(f"[PoseAlign] Manual mode - B: scale={scale_B:.3f}, angle={angle_deg_B:.1f}°, tx={tx_B}, ty={ty_B}")
         else:
             # automatic mode – identical to original implementation
             need_fit = reset or self._MA is None or self._MB is None
@@ -335,11 +483,20 @@ class PoseAlignTwoToOne(PreviewImage):
                     m1, m2 = two_largest(cv2.cvtColor(ref_np, cv2.COLOR_BGR2GRAY) > 2)
                     kR1, kR2 = extract_kps_from_mask(ref_np, m1), extract_kps_from_mask(ref_np, m2)
 
-                # pose A & B key-points
+                # pose A & B key-points with offset correction tracking
                 kA_json = self._get_kps(A_np, poseA_json, 0)
                 kB_json = self._get_kps(B_np, poseB_json, 0)
                 kA_img = extract_kps_from_mask(A_np)
                 kB_img = extract_kps_from_mask(B_np)
+                
+                # Calculate and store offset corrections
+                offset_A = estimate_translation(kA_json, kA_img)
+                offset_B = estimate_translation(kB_json, kB_img)
+                self._offset_corrections = {
+                    'A': {'x': float(offset_A[0]), 'y': float(offset_A[1])},
+                    'B': {'x': float(offset_B[0]), 'y': float(offset_B[1])}
+                }
+                
                 kA = correct_json_offset(kA_json, kA_img)
                 kB = correct_json_offset(kB_json, kB_img)
 
@@ -363,10 +520,22 @@ class PoseAlignTwoToOne(PreviewImage):
                 MA = np.hstack([sA * RA, tA[:, None]]).astype(np.float32)
                 MB = np.hstack([sB * RB, tB[:, None]]).astype(np.float32)
                 self._MA, self._MB, self._out_size = MA, MB, (w, h)
+                
+                # **KEY FIX**: Decompose matrices and update widget values for canvas
+                self._update_widget_values(cx, cy, debug)
+                
                 if debug:
                     print(f"[PoseAlign] cached new transforms | size: {(w, h)}")
+                    print(f"[PoseAlign] Matrix A:\n{MA}")
+                    print(f"[PoseAlign] Matrix B:\n{MB}")
+                    print(f"[PoseAlign] Offset corrections: {self._offset_corrections}")
             else:
                 MA, MB = self._MA, self._MB
+                # Update widget values even when using cached matrices
+                self._update_widget_values(cx, cy, debug)
+
+        # Store transformation data for canvas access
+        self._store_transform_data_for_canvas(debug)
 
         # ─────────────────── apply transforms to batch ─────────────────
         outA, outB, outC, outAll = [], [], [], []
@@ -399,7 +568,6 @@ class PoseAlignTwoToOne(PreviewImage):
             result["ui"] = ui_result["ui"]
             
         return result
-
 
 # ───────────────────── pose viewer debug node (unchanged) ──────────────────
 class PoseViewer:
@@ -436,14 +604,48 @@ class PoseViewer:
                     cv2.circle(img_np,tuple(np.int32(pt)),point_radius,color,-1)
                     cv2.circle(img_np,tuple(np.int32(pt)),point_radius,(0,0,0),2)
         return (u8_to_torch(img_np),)
+        
 
-# ─────────────────────── node registration ───────────────────────────────
-NODE_CLASS_MAPPINGS={
-    "PoseAlignTwoToOne":PoseAlignTwoToOne,
-    "PoseViewer":PoseViewer,
-}
-NODE_DISPLAY_NAME_MAPPINGS={
-    "PoseAlignTwoToOne":"Pose Align (2→1)",
-    "PoseViewer":"Pose Viewer (Debug)",
+# ──────────────────────────── API Route for Canvas Data Access ─────────────────────────
+async def get_pose_align_data(request):
+    """API endpoint to get transformation data for canvas"""
+    try:
+        node_id = request.match_info.get('node_id')
+        data = get_transform_data(node_id)
+        
+        if data is None:
+            return web.json_response({'error': 'No data found for node'}, status=404)
+        
+        return web.json_response(data)
+    except Exception as e:
+        return web.json_response({'error': str(e)}, status=500)
+
+# Register the API route (this should be called when ComfyUI loads the extension)
+def register_api_routes(app):
+    """Register API routes for pose align data"""
+    app.router.add_get('/AInseven/pose_align_data/{node_id}', get_pose_align_data)
+
+# Node class mappings for ComfyUI
+NODE_CLASS_MAPPINGS = {
+    "PoseAlignTwoToOne": PoseAlignTwoToOne
 }
 
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "PoseAlignTwoToOne": "Pose Align Two To One (Fixed)"
+}
+
+# Try to register API routes if ComfyUI app is available
+try:
+    from main import app
+    register_api_routes(app)
+    print("[PoseAlign] API routes registered successfully")
+except:
+    print("[PoseAlign] Could not register API routes - will try later")
+    # Alternative registration method
+    try:
+        import server
+        if hasattr(server, 'app'):
+            register_api_routes(server.app)
+            print("[PoseAlign] API routes registered via server module")
+    except:
+        print("[PoseAlign] API routes not registered - canvas sync may not work")
